@@ -265,7 +265,14 @@ def run():
 
     final_df = pd.concat(all_cleaned).reset_index(drop=True)
 
-    final_df = final_df.fillna('None')
+    # Replace string 'None' or NaN in numeric columns with Python None
+    numeric_cols = ['screentime', 'offscreentime']
+    for col in numeric_cols:
+        if col in final_df.columns:
+            # Convert any existing string 'None' to np.nan first
+            final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
+            # Replace NaN with Python None
+            final_df[col] = final_df[col].where(pd.notnull(final_df[col]), None)
 
     # ---- Ensure tz-aware timestamps are JSON serializable for PostgREST ----
     def safe_isoformat(x):
