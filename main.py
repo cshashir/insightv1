@@ -6,6 +6,7 @@
 
 import os, json
 import pandas as pd
+import datetime
 import pytz
 from supabase import create_client
 from google_play_scraper import app as gp_app
@@ -267,9 +268,17 @@ def run():
     final_df = final_df.fillna('None')
 
     # ---- Ensure tz-aware timestamps are JSON serializable for PostgREST ----
+    def safe_isoformat(x):
+        if x is None or pd.isna(x):
+            return None
+        if isinstance(x, (pd.Timestamp, datetime.datetime)):
+            return x.isoformat()
+        return str(x)  # already a string or unexpected type
+    
     for col in ["ts", "next_ts"]:
         if col in final_df.columns:
-            final_df[col] = final_df[col].apply(lambda x: x.isoformat() if pd.notnull(x) else None)
+            final_df[col] = final_df[col].apply(safe_isoformat)
+
 
     print(f"Saving {len(final_df)} cleaned rows to Supabase ...")
     rows = final_df.to_dict(orient="records")
