@@ -264,6 +264,8 @@ def run():
 
     final_df = pd.concat(all_cleaned).reset_index(drop=True)
 
+    final_df = final_df.fillna('None')
+
     # ---- Ensure tz-aware timestamps are JSON serializable for PostgREST ----
     for col in ["ts", "next_ts"]:
         if col in final_df.columns:
