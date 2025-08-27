@@ -230,11 +230,30 @@ def add_metadata(events_df: pd.DataFrame) -> pd.DataFrame:
 
 # ================== Main Runner ==================
 def run():
+    print("Fetching last processed timestamps from cleaned_usage_data ...")
+    cleaned_res = sb.table("cleaned_usage_data").select("device_id,timestamp", count="exact").execute()
+    cleaned_df = pd.DataFrame(cleaned_res.data)
+    if not cleaned_df.empty:
+        last_processed = cleaned_df.groupby("device_id")["timestamp"].max().to_dict()
+    else:
+        last_processed = {}
+
     print("Fetching raw_usage_data from Supabase ...")
     raw = sb.table("usage_data").select("*").execute()
     df_raw = pd.DataFrame(raw.data)
     if df_raw.empty:
         print("No raw data found.")
+        return
+
+    # ================= Incremental filter =================
+    def is_new(row):
+        device_id = row["device_id"]
+        ts = row["timestamp"]
+        return ts > last_processed.get(device_id, 0)
+
+    df_raw = df_raw[df_raw.apply(is_new, axis=1)]
+    if df_raw.empty:
+        print("No new usage data to process.")
         return
 
     print("Deduplicating raw rows ...")
@@ -266,27 +285,28 @@ def run():
 
     final_df = pd.concat(all_cleaned).reset_index(drop=True)
 
-    # Replace string 'None' or NaN in numeric columns with Python None
+    # Replace NaN, inf, -inf with Python None (safe for Supabase)
     final_df = final_df.replace([np.nan, np.inf, -np.inf], None)
 
-    # ---- Ensure tz-aware timestamps are JSON serializable for PostgREST ----
+    # Ensure tz-aware timestamps are JSON serializable
     def safe_isoformat(x):
         if x is None or pd.isna(x):
             return None
         if isinstance(x, (pd.Timestamp, datetime.datetime)):
             return x.isoformat()
-        return str(x)  # already a string or unexpected type
+        return str(x)
     
     for col in ["ts", "next_ts"]:
         if col in final_df.columns:
             final_df[col] = final_df[col].apply(safe_isoformat)
 
-
-    print(f"Saving {len(final_df)} cleaned rows to Supabase ...")
+    print(f"Saving {len(final_df)} new cleaned rows to Supabase ...")
     rows = final_df.to_dict(orient="records")
-    sb.table("cleaned_usage_data").upsert(rows).execute()
-    print("✅ Saved cleaned data to Supabase.")
+    if rows:
+        sb.table("cleaned_usage_data").upsert(rows).execute()
+        print("✅ Saved new cleaned data to Supabase.")
+    else:
+        print("No new cleaned rows to save.")
 
 if __name__ == "__main__":
     run()
-
