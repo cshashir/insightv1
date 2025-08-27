@@ -6,6 +6,7 @@
 
 import os, json
 import pandas as pd
+import numpy as np
 import datetime
 import pytz
 from supabase import create_client
