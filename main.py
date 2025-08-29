@@ -231,9 +231,11 @@ def add_metadata(events_df: pd.DataFrame) -> pd.DataFrame:
 # ================== Main Runner ==================
 def run():
     print("Fetching last processed timestamps from cleaned_usage_data ...")
-    cleaned_res = sb.table("cleaned_usage_data").select("device_id,timestamp", count="exact").execute()
+    cleaned_res = sb.table("cleaned_usage_data").select("device_id,timestamp").execute()
     cleaned_df = pd.DataFrame(cleaned_res.data)
     if not cleaned_df.empty:
+        # ensure int
+        cleaned_df["timestamp"] = pd.to_numeric(cleaned_df["timestamp"], errors="coerce").fillna(0).astype("int64")
         last_processed = cleaned_df.groupby("device_id")["timestamp"].max().to_dict()
     else:
         last_processed = {}
@@ -245,17 +247,6 @@ def run():
         print("No raw data found.")
         return
 
-    # ================= Incremental filter =================
-    def is_new(row):
-        device_id = row["device_id"]
-        ts = row["timestamp"]
-        return ts > last_processed.get(device_id, 0)
-
-    df_raw = df_raw[df_raw.apply(is_new, axis=1)]
-    if df_raw.empty:
-        print("No new usage data to process.")
-        return
-
     print("Deduplicating raw rows ...")
     df_raw = dedupe_rows(df_raw, gap_seconds=10)
 
@@ -263,6 +254,15 @@ def run():
     events_df = explode_events(df_raw)
     if events_df.empty:
         print("No events found after explode.")
+        return
+
+    # ========= Incremental filter at EVENT level =========
+    print("Filtering to only new events per device ...")
+    def is_new_event(row):
+        return int(row["timestamp"]) > int(last_processed.get(row["device_id"], 0))
+    events_df = events_df[events_df.apply(is_new_event, axis=1)]
+    if events_df.empty:
+        print("No new usage events to process.")
         return
 
     print("Fetching Google Play metadata ...")
@@ -283,30 +283,66 @@ def run():
         summary['device_id'] = device_id
         all_cleaned.append(summary)
 
+    if not all_cleaned:
+        print("No processed data generated.")
+        return
+
     final_df = pd.concat(all_cleaned).reset_index(drop=True)
 
-    # Replace NaN, inf, -inf with Python None (safe for Supabase)
+    # Safety: enforce types for key columns
+    key_cols = ["device_id", "timestamp", "package", "type"]
+    for c in key_cols:
+        if c not in final_df.columns:
+            final_df[c] = None
+    final_df["timestamp"] = pd.to_numeric(final_df["timestamp"], errors="coerce").astype("Int64")
+
+    # Final incremental filter AGAIN (post-cleaning) on event timestamp, to avoid overlaps
+    if last_processed:
+        final_df = final_df[final_df.apply(lambda r: int(r["timestamp"]) > int(last_processed.get(r["device_id"], 0)), axis=1)]
+
+    # Batch de-dupe on composite key
+    final_df = final_df.dropna(subset=key_cols)
+    final_df = final_df.drop_duplicates(subset=key_cols).reset_index(drop=True)
+
+    # Replace NaN/inf with None for JSON/Supabase
     final_df = final_df.replace([np.nan, np.inf, -np.inf], None)
 
-    # Ensure tz-aware timestamps are JSON serializable
+    # ---- Ensure tz-aware timestamps are JSON serializable for PostgREST ----
     def safe_isoformat(x):
-        if x is None or pd.isna(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
             return None
         if isinstance(x, (pd.Timestamp, datetime.datetime)):
             return x.isoformat()
         return str(x)
-    
+
     for col in ["ts", "next_ts"]:
         if col in final_df.columns:
             final_df[col] = final_df[col].apply(safe_isoformat)
 
-    print(f"Saving {len(final_df)} new cleaned rows to Supabase ...")
     rows = final_df.to_dict(orient="records")
-    if rows:
-        sb.table("cleaned_usage_data").upsert(rows).execute()
-        print("✅ Saved new cleaned data to Supabase.")
-    else:
+    print(f"Saving {len(rows)} new cleaned rows to Supabase ...")
+
+    if not rows:
         print("No new cleaned rows to save.")
+        return
+
+    # Conflict-safe upsert using your unique constraint (device_id, timestamp, package, type)
+    try:
+        sb.table("cleaned_usage_data").upsert(
+            rows,
+            on_conflict="device_id,timestamp,package,type",
+            returning="minimal",
+            ignore_duplicates=True  # some versions support this to "do nothing" on conflict
+        ).execute()
+    except TypeError:
+        # Fallback if client doesn't support ignore_duplicates
+        sb.table("cleaned_usage_data").upsert(
+            rows,
+            on_conflict="device_id,timestamp,package,type",
+            returning="minimal"
+        ).execute()
+
+    print("✅ Saved new cleaned data to Supabase.")
 
 if __name__ == "__main__":
     run()
